@@ -9,6 +9,8 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import GridSearchCV, StratifiedShuffleSplit
 from sklearn.utils import shuffle
 
+from scipy.ndimage.measurements import label
+
 from skimage.feature import hog
 
 import os
@@ -59,9 +61,11 @@ class FeatureExtractor:
         # In order to generalize the code for single image & multiple
         # images, single images are turned into an array of one image.
         if isinstance(img, np.ndarray) and len(img.shape) in (2, 3):
-            img = np.array([[img]])
+            img = np.array([img])
+            single_img_mode = True
         else:
             img = tqdm.tqdm(img)
+            single_img_mode = False
 
         features = []
         for single_img in img:
@@ -88,7 +92,7 @@ class FeatureExtractor:
             features.append(img_features)
 
         features = np.array(features)
-        if isinstance(img, np.ndarray) and len(img.shape) in (2, 3):
+        if single_img_mode:
             features = features.reshape(1, -1)
         else:
             self._scaler.fit(features)
@@ -156,14 +160,15 @@ class VehicleDetector:
         self._feature_extractor = None
 
         if load_from_cache and os.path.exists(cached_pickle_path):
-            print('Found cached classier. Loading classier')
+            print('Found cached classifier. Loading classifier')
             with open(cached_pickle_path, 'rb') as f:
                 cache = pickle.load(f)
             self._cls = cache['cls']
             self._feature_extractor = cache['feature_extractor']
             self.trained = True
+            print('Classifier loaded successfully (accuracy={})'.format(cache['accuracy']))
         else:
-            print('Creating classier')
+            print('Creating classifier')
             self._cls = svm.LinearSVC()
             self.trained = False
 
@@ -288,22 +293,26 @@ class DetectionPipeline:
         self._first_run = False
         self._detector = detector
         self._feature_extractor = detector.get_feature_extractor()
+        self._window_list = None
 
     def __call__(self, img: np.ndarray):
         # On first run, calculate pipeline properties
         if not self._first_run:
-            self._calc_pipeline_properties(img.shape, window_size_range=[8, 64])
+            self._calc_pipeline_properties(img.shape, window_overlap=(0.5, 0.5), window_size_range=(16, 256, 8))
             self._first_run = True
 
         roi = self._get_region_of_interest(img)
         # Calculate HOG for all the region of interest because its faster then
         # doing this calculation on each detected patch.
-        hog_roi = self._feature_extractor.hog(roi)
+        # TODO: hog without feature extraction to roi.
+        # hog_roi = self._feature_extractor(roi, hog_features=True, spatial_features=False, color_features=False)
+        detected = self._search_windows(img)
+        heatmap = self._create_heatmap(detected)
+        detected = self._detect_from_heatmap(heatmap, threshold=5)
+        return self._draw_boxes(img, detected)
 
-        return img
-
-    def _calc_pipeline_properties(self, img_shape, window_size_range):
-        self._img_shape = img_shape[0:1]
+    def _calc_pipeline_properties(self, img_shape, window_overlap, window_size_range):
+        self._img_shape = img_shape[0:2]
 
         # Calc image limits for the region of interest
         self._start_stop_x = [0, img_shape[1]]
@@ -311,18 +320,96 @@ class DetectionPipeline:
 
         # Calculate the sliding windows map for this region of interest
         avg_size = np.average(window_size_range)
+        # Initialize a list to append window positions to
+        window_list = []
 
         span_x = self._start_stop_x[1] - self._start_stop_x[0]
         span_y = self._start_stop_y[1] - self._start_stop_y[0]
 
-        # TODO: finish up window calculation (changing size)
+        for window_size in range(*window_size_range):
+            size = (window_size, window_size)
+
+            # Compute the number of pixels per step in x/y
+            step_x = size[0] * (1 - window_overlap[0])
+            step_y = size[1] * (1 - window_overlap[1])
+
+            # Compute the number of windows in x/y
+            windows_x = int((span_x - size[0]) // step_x + 1)
+            windows_y = int((span_y - size[1]) // step_y + 1)
+
+            n_windows = windows_x * windows_y
+            # Loop through finding x and y window positions
+            for window in range(n_windows):
+                # Calculate each window position
+                pos_x = np.int(self._start_stop_x[0] + (window % windows_x) * step_x)
+                pos_y = np.int(self._start_stop_y[0] + (window // windows_x) * step_y)
+                top_left = (pos_x, pos_y)
+                bottom_right = (pos_x + size[0], pos_y + size[1])
+                # Append window position to list
+                window_list.append((top_left, bottom_right))
+
+        self._window_list = window_list
 
     def _get_region_of_interest(self, img):
         start_x, stop_x = self._start_stop_x
         start_y, stop_y = self._start_stop_y
 
-        return img[start_x:stop_x, start_y:stop_y, :]
+        return img[start_y:stop_y, start_x:stop_x, :]
 
+    def _search_windows(self, img):
+
+        # 1) Create an empty list to receive positive detection windows
+        on_windows = []
+        # 2) Iterate over all windows in the list
+        for window in self._window_list:
+            # 3) Extract the test window from original image
+            test_img = cv2.resize(img[window[0][1]:window[1][1], window[0][0]:window[1][0]], (64, 64))
+            # 4) Extract features for that window using single_img_features()
+            features = self._feature_extractor(test_img)
+            # 6) Predict using your classifier
+            prediction = self._detector.predict(features)
+            # 7) If positive (prediction == 1) then save the window
+            if prediction == 1:
+                on_windows.append(window)
+        # 8) Return windows for positive detections
+        return on_windows
+
+    def _draw_boxes(self, img, bboxes, color=(0, 0, 255), thick=6):
+        # Make a copy of the image
+        imcopy = np.copy(img)
+        # Iterate through the bounding boxes
+        for bbox in bboxes:
+            # Draw a rectangle given bbox coordinates
+            cv2.rectangle(imcopy, bbox[0], bbox[1], color, thick)
+        # Return the image copy with boxes drawn
+        return imcopy
+
+    def _create_heatmap(self, detections):
+        heatmap = np.zeros(self._img_shape)
+
+        for detection in detections:
+            heatmap[detection[0][1]:detection[1][1], detection[0][0]:detection[1][0]] += 1
+
+        return heatmap
+
+    def _detect_from_heatmap(self, heatmap, threshold):
+        # Apply threshold
+        heatmap[heatmap <= threshold] = 0
+
+        labels = label(heatmap)
+        car_boxes = []
+        for car_number in range(1, labels[1] + 1):
+            # Find pixels with each car_number label value
+            nonzero = (labels[0] == car_number).nonzero()
+            # Identify x and y values of those pixels
+            nonzeroy = np.array(nonzero[0])
+            nonzerox = np.array(nonzero[1])
+            # Define a bounding box based on min/max x and y
+            bbox = ((np.min(nonzerox), np.min(nonzeroy)), (np.max(nonzerox), np.max(nonzeroy)))
+            # Draw the box on the image
+            car_boxes.append(bbox)
+
+        return car_boxes
 
 def main():
     input_path = 'test_images'
