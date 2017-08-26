@@ -308,7 +308,7 @@ class DetectionPipeline:
         # hog_roi = self._feature_extractor(roi, hog_features=True, spatial_features=False, color_features=False)
         detected = self._search_windows(img)
         heatmap = self._create_heatmap(detected)
-        detected = self._detect_from_heatmap(heatmap, threshold=5)
+        detected = self._detect_from_heatmap(heatmap, threshold=6)
         return self._draw_boxes(img, detected)
 
     def _calc_pipeline_properties(self, img_shape, window_overlap, window_size_range):
@@ -316,37 +316,50 @@ class DetectionPipeline:
 
         # Calc image limits for the region of interest
         self._start_stop_x = [0, img_shape[1]]
-        self._start_stop_y = [img_shape[0]//2, img_shape[0]]
+        self._start_stop_y = [400, 680]
 
         # Calculate the sliding windows map for this region of interest
         avg_size = np.average(window_size_range)
         # Initialize a list to append window positions to
         window_list = []
 
-        span_x = self._start_stop_x[1] - self._start_stop_x[0]
-        span_y = self._start_stop_y[1] - self._start_stop_y[0]
+        n_sizes = len(range(*window_size_range))
 
+        y_region_step = (self._start_stop_y[1] - self._start_stop_y[0]) // n_sizes
+        y_region = np.array([self._start_stop_y[0], self._start_stop_y[0] + y_region_step])
+
+        start_stop_y = np.array([y_region[0] + window_size_range[0], y_region[1] + window_size_range[0]])
         for window_size in range(*window_size_range):
             size = (window_size, window_size)
+            start_stop_x = self._start_stop_x
+
+            span_x = start_stop_x[1] - start_stop_x[0]
+            span_y = start_stop_y[1] - start_stop_y[0]
 
             # Compute the number of pixels per step in x/y
             step_x = size[0] * (1 - window_overlap[0])
             step_y = size[1] * (1 - window_overlap[1])
 
             # Compute the number of windows in x/y
-            windows_x = int((span_x - size[0]) // step_x + 1)
-            windows_y = int((span_y - size[1]) // step_y + 1)
+            windows_x = int(np.abs(span_x - size[0]) // step_x + 1)
+            windows_y = int(np.abs(span_y - size[1]) // step_y + 1)
 
             n_windows = windows_x * windows_y
             # Loop through finding x and y window positions
             for window in range(n_windows):
                 # Calculate each window position
-                pos_x = np.int(self._start_stop_x[0] + (window % windows_x) * step_x)
-                pos_y = np.int(self._start_stop_y[0] + (window // windows_x) * step_y)
-                top_left = (pos_x, pos_y)
-                bottom_right = (pos_x + size[0], pos_y + size[1])
+                pos_x = np.int(start_stop_x[0] + (window % windows_x) * step_x)
+                pos_y = np.int(start_stop_y[0] + (window // windows_x) * step_y)
+
+                if pos_y >= self._start_stop_y[1]:
+                    break
+
+                bottom_right = (pos_x + size[0], pos_y)
+                top_left = (pos_x, pos_y - size[1])
                 # Append window position to list
                 window_list.append((top_left, bottom_right))
+
+            start_stop_y += y_region_step
 
         self._window_list = window_list
 
