@@ -69,23 +69,23 @@ class FeatureExtractor:
 
         features = []
         for single_img in img:
-            single_img = self._change_color_space(single_img)
+            single_img = self.change_color_space(single_img)
 
             img_features = []
 
             if isinstance(hog_features, bool) and hog_features:
-                img_features.append(self._hog(single_img))
-            elif hog_features is np.ndarray:
+                img_features.append(self.hog(single_img))
+            elif isinstance(hog_features, np.ndarray):
                 img_features.append(hog_features)
 
             if isinstance(spatial_features, bool) and spatial_features:
                 img_features.append(self._spatial(single_img))
-            elif spatial_features is np.ndarray:
+            elif isinstance(spatial_features, np.ndarray):
                 img_features.append(spatial_features)
 
             if isinstance(color_features, bool) and color_features:
                 img_features.append(self._color_hist(single_img))
-            elif color_features is np.ndarray:
+            elif isinstance(color_features, np.ndarray):
                 img_features.append(color_features)
 
             img_features = np.concatenate(img_features).astype(np.float64)
@@ -118,15 +118,21 @@ class FeatureExtractor:
                            visualise=vis, feature_vector=feature_vec)
             return features
 
-    def _hog(self, img: np.ndarray):
+    def hog(self, img: np.ndarray, feature_vec=True):
         if self._hog_channels == 'ALL':
             hog_features = []
             for channel in range(img.shape[2]):
-                hog_features.extend(self._get_hog_features(img[:, :, channel], vis=False, feature_vec=True))
+                hog_channel = self._get_hog_features(img[:, :, channel], vis=False, feature_vec=feature_vec)
+                if feature_vec:
+                    hog_features.extend(hog_channel)
+                else:
+                    hog_features.append(hog_channel)
         else:
-            hog_features = self._get_hog_features(img[:, :, self._hog_channels], vis=False, feature_vec=True)
+            hog_features = self._get_hog_features(img[:, :, self._hog_channels], vis=False, feature_vec=feature_vec)
+            if not feature_vec:
+                hog_features = [hog_features]
 
-        return np.array(hog_features)
+        return hog_features
 
     def _spatial(self, img: np.ndarray):
         return cv2.resize(img, self._spatial_size).ravel()
@@ -139,11 +145,45 @@ class FeatureExtractor:
 
         return np.array(np.concatenate(hist_features))
 
-    def _change_color_space(self, img):
+    def change_color_space(self, img):
         if self._cvt_code is not None:
             return cv2.cvtColor(img, self._cvt_code)
         else:
             return np.copy(img)
+
+    def extract_hog_features(self, hog_img, box, sizing_factor):
+        # Calculate the box after resizing
+        sized_box = [[int(box[0][0] * sizing_factor), int(box[0][1] * sizing_factor)],
+                     [int(box[1][0] * sizing_factor), int(box[1][1] * sizing_factor)]]
+        # Convert pixel to cells
+        cell_box = self._point_px_cell_conv(sized_box, mode='px2cell')
+
+        # Extract HOG features
+        hog_features = []
+        for channel in hog_img:
+            selection = channel[cell_box[0][1]: cell_box[1][1] - 1,
+                                cell_box[0][0]: cell_box[1][0] - 1].ravel()
+            hog_features.append(selection)
+
+        hog_features = np.hstack(hog_features)
+
+        # Convert the cell back to pixels in order to let the feature extractor select
+        # the same region that was extracted.
+        return hog_features, self._point_px_cell_conv(cell_box, mode='cell2px')
+
+    def _point_px_cell_conv(self, box, mode='px2cell'):
+        conv_box = []
+        for point in box:
+            conv_point = None
+            if mode == 'px2cell':
+                conv_point = [point[0] // self._hog_pix_per_cell, point[1] // self._hog_pix_per_cell]
+            elif mode == 'cell2px':
+                conv_point = [point[0] * self._hog_pix_per_cell, point[1] * self._hog_pix_per_cell]
+            else:
+                raise Exception('Unknown conversion type')
+            conv_box.append(conv_point)
+
+        return conv_box
 
 
 class VehicleDetector:
@@ -298,17 +338,12 @@ class DetectionPipeline:
     def __call__(self, img: np.ndarray):
         # On first run, calculate pipeline properties
         if not self._first_run:
-            self._calc_pipeline_properties(img.shape, window_overlap=(0.5, 0.5), window_size_range=(16, 256, 8))
+            self._calc_pipeline_properties(img.shape, window_overlap=(0.75, 0.75), window_size_range=(16, 256, 16))
             self._first_run = True
 
-        roi = self._get_region_of_interest(img)
-        # Calculate HOG for all the region of interest because its faster then
-        # doing this calculation on each detected patch.
-        # TODO: hog without feature extraction to roi.
-        # hog_roi = self._feature_extractor(roi, hog_features=True, spatial_features=False, color_features=False)
-        detected = self._search_windows(img)
-        heatmap = self._create_heatmap(detected)
-        detected = self._detect_from_heatmap(heatmap, threshold=6)
+        found = self._search_windows(img)
+        heatmap = self._create_heatmap(found)
+        detected = self._detect_from_heatmap(heatmap, threshold=5)
         return self._draw_boxes(img, detected)
 
     def _calc_pipeline_properties(self, img_shape, window_overlap, window_size_range):
@@ -318,8 +353,6 @@ class DetectionPipeline:
         self._start_stop_x = [0, img_shape[1]]
         self._start_stop_y = [400, 680]
 
-        # Calculate the sliding windows map for this region of interest
-        avg_size = np.average(window_size_range)
         # Initialize a list to append window positions to
         window_list = []
 
@@ -341,8 +374,8 @@ class DetectionPipeline:
             step_y = size[1] * (1 - window_overlap[1])
 
             # Compute the number of windows in x/y
-            windows_x = int(np.abs(span_x - size[0]) // step_x + 1)
-            windows_y = int(np.abs(span_y - size[1]) // step_y + 1)
+            windows_x = int(np.abs(span_x - size[0]) // step_x)
+            windows_y = int(np.abs(span_y - size[1]) // step_y)
 
             n_windows = windows_x * windows_y
             # Loop through finding x and y window positions
@@ -351,8 +384,12 @@ class DetectionPipeline:
                 pos_x = np.int(start_stop_x[0] + (window % windows_x) * step_x)
                 pos_y = np.int(start_stop_y[0] + (window // windows_x) * step_y)
 
+                # Stop if windows are out of height limits
                 if pos_y >= self._start_stop_y[1]:
                     break
+                # Skip windows the exceed width limits
+                if (pos_x + size[0]) >= self._start_stop_x[1]:
+                    continue
 
                 bottom_right = (pos_x + size[0], pos_y)
                 top_left = (pos_x, pos_y - size[1])
@@ -371,20 +408,45 @@ class DetectionPipeline:
 
     def _search_windows(self, img):
 
-        # 1) Create an empty list to receive positive detection windows
+        target_size = 64
+        # Convert to destination color space
+        sized_image = None
+        color = self._feature_extractor.change_color_space(img)
+        # Hog parameters
+        hog_window_size = 0
+        hog_img = None
+        sizing_factor = 0
+        # Create an empty list to receive positive detection windows
         on_windows = []
-        # 2) Iterate over all windows in the list
+        # Iterate over all windows in the list
         for window in self._window_list:
-            # 3) Extract the test window from original image
-            test_img = cv2.resize(img[window[0][1]:window[1][1], window[0][0]:window[1][0]], (64, 64))
-            # 4) Extract features for that window using single_img_features()
-            features = self._feature_extractor(test_img)
-            # 6) Predict using your classifier
+            # Windows are symmetric so its enough to calculate only one dimension
+            # in order to get the window size.
+            window_size = window[1][0] - window[0][0]
+
+            # Its assumed that the windows are sorted by size,
+            # that's why it enough to calculate HOG once for each size.
+            if hog_window_size != window_size:
+                hog_window_size = window_size
+                sizing_factor = target_size / window_size
+                new_size = (int(img.shape[1] * sizing_factor), int(img.shape[0] * sizing_factor))
+                sized_image = cv2.resize(img, new_size)
+                color = self._feature_extractor.change_color_space(sized_image)
+                hog_img = self._feature_extractor.hog(color, feature_vec=False)
+
+            hog_features, hog_window = self._feature_extractor.extract_hog_features(hog_img, window, sizing_factor)
+            # Extract the test window from original image
+            # test_img = cv2.resize(img[hog_window[0][1]:hog_window[1][1], hog_window[0][0]:hog_window[1][0]],
+            #                       (target_size, target_size))
+            test_img = sized_image[hog_window[0][1]:hog_window[1][1], hog_window[0][0]:hog_window[1][0]]
+            # Extract features for that window using single_img_features()
+            features = self._feature_extractor(test_img, hog_features=hog_features)
+            # Predict using your classifier
             prediction = self._detector.predict(features)
-            # 7) If positive (prediction == 1) then save the window
+            # If positive (prediction == 1) then save the window
             if prediction == 1:
                 on_windows.append(window)
-        # 8) Return windows for positive detections
+        # Return windows for positive detections
         return on_windows
 
     def _draw_boxes(self, img, bboxes, color=(0, 0, 255), thick=6):
@@ -415,10 +477,10 @@ class DetectionPipeline:
             # Find pixels with each car_number label value
             nonzero = (labels[0] == car_number).nonzero()
             # Identify x and y values of those pixels
-            nonzeroy = np.array(nonzero[0])
-            nonzerox = np.array(nonzero[1])
+            nonzero_y = np.array(nonzero[0])
+            nonzero_x = np.array(nonzero[1])
             # Define a bounding box based on min/max x and y
-            bbox = ((np.min(nonzerox), np.min(nonzeroy)), (np.max(nonzerox), np.max(nonzeroy)))
+            bbox = ((np.min(nonzero_x), np.min(nonzero_y)), (np.max(nonzero_x), np.max(nonzero_y)))
             # Draw the box on the image
             car_boxes.append(bbox)
 
@@ -426,6 +488,8 @@ class DetectionPipeline:
 
 def main():
     input_path = 'test_images'
+    # input_path = 'test_video.mp4'
+    #input_path = 'project_video.mp4'
     output_path = 'output_images'
 
     print('Vehicle detection script is starting...')
@@ -455,11 +519,12 @@ def main():
         suffix = file.split('.')[1]
         if suffix == 'jpg':
             # Image processing pipeline
+            print('Processing image \'{}\'.'.format(file))
             pipeline = DetectionPipeline(detector)
             img = mpimg.imread(file_path)
             dst = pipeline(img)
-            print(file)
             mpimg.imsave(os.path.join(output_path, file), dst)
+            print('Finished processing image \'{}\'.'.format(file))
         elif suffix == 'mp4':
             # Video processing pipeline
             pipeline = DetectionPipeline(detector)
