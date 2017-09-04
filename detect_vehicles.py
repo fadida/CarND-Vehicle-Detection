@@ -448,6 +448,7 @@ class DetectionPipeline:
         self._detector = detector
         self._feature_extractor = detector.get_feature_extractor()
         self._window_list = None
+        self._prev_detections = None
 
     def __call__(self, img: np.ndarray):
         """
@@ -462,7 +463,9 @@ class DetectionPipeline:
 
         found = self._search_windows(img)
         self._apply_to_heatmap(found)
+
         detected = self._detect_from_heatmap(threshold=6)
+        detected = self._calc_detection_from_prev(detected, 15)
         return self._draw_boxes(img, detected)
 
     def _calc_pipeline_properties(self, img_shape, window_overlap, window_size_range):
@@ -478,9 +481,6 @@ class DetectionPipeline:
         # Calc image limits for the region of interest
         self._start_stop_x = [0, img_shape[1]]
         self._start_stop_y = [400, 680]
-
-        # Create heatmap
-        self._heatmap = np.zeros(self._img_shape)
 
         # Initialize a list to append window positions to
         window_list = []
@@ -616,6 +616,9 @@ class DetectionPipeline:
         avoidance algorithm.
         :param detections: The detected boxes.
         """
+        # Create heatmap
+        self._heatmap = np.zeros(self._img_shape)
+
         for detection in detections:
             self._heatmap[detection[0][1]:detection[1][1], detection[0][0]:detection[1][0]] += 1
 
@@ -643,6 +646,46 @@ class DetectionPipeline:
             car_boxes.append(bbox)
 
         return car_boxes
+
+    def _calc_detection_from_prev(self, detections, threshold):
+        """
+        Calculate the distance between current predictions & previous predictions
+        and filter detections that are lower then the threshold.
+        :param detections: The current detections, list of rectangles.
+        :param threshold: The threshold which decides if to filter a detection.
+        :return: A list filtered detections.
+        """
+        # Calculate the center of each of the rectangles
+        detections_center = []
+        for box in detections:
+            width = box[1][0] - box[0][0]
+            height = box[1][1] - box[0][1]
+            center = (box[0][0] + width // 2, box[0][1] + height // 2)
+            detections_center.append(center)
+
+        # If there are no previous detections, all detection are far.
+        if self._prev_detections is None:
+            self._prev_detections = detections_center
+            return detections
+
+        filtered = []
+
+        # For each detection, measure the distance its center to the previous detection
+        # center
+        for idx, center in enumerate(detections_center):
+            filter_pass = False
+            for prev in self._prev_detections:
+                distance = np.sqrt(np.square(center[0] - prev[0]) + np.square(center[1] - prev[1]))
+                if distance < threshold:
+                    filter_pass = True
+                    break
+            if filter_pass:
+                filtered.append(detections[idx])
+
+        self._prev_detections = detections_center
+
+        return filtered
+
 
 def main():
     input_path = 'test_images'
@@ -679,6 +722,7 @@ def main():
         if suffix == 'jpg':
             # Image processing pipeline
             print('Processing image \'{}\'.'.format(file))
+            # Create a new pipeline for each image
             pipeline = DetectionPipeline(detector)
             img = mpimg.imread(file_path)
             dst = pipeline(img)
@@ -686,13 +730,13 @@ def main():
             print('Finished processing image \'{}\'.'.format(file))
         elif suffix == 'mp4':
             # Video processing pipeline
+            # Create a new pipeline for each video
             pipeline = DetectionPipeline(detector)
-            clip = VideoFileClip(file_path)
+            clip = VideoFileClip(file_path) # .subclip(5, 9)
             dst = clip.fl_image(pipeline)
             dst.write_videofile(os.path.join(output_path, file), audio=False)
 
     print('Done. Processed files can be found at {}'.format(output_path))
-
 
 if __name__ == '__main__':
     main()
